@@ -79,14 +79,78 @@ Even if Claude tried to use network tools, they're explicitly denied:
 
 **Immutability:** The settings file has `chattr +i` set, making it immutable even to root inside the chroot.
 
-### 4. Privilege Separation
+### 4. Nix Store Isolation (Read-Only Cache)
+
+The Nix store (`/nix`) is bind-mounted from the host, but this provides a **closed system** that prevents Claude from expanding its toolset.
+
+**How it works:**
+
+```
+Host System                          Chroot
+┌─────────────────┐                 ┌─────────────────┐
+│ /nix/store/     │ ──bind mount──▶ │ /nix/store/     │
+│  (read-write)   │                 │  (read-only)    │
+│                 │                 │                 │
+│ Contains only   │                 │ Cannot add new  │
+│ packages you've │                 │ packages here   │
+│ installed       │                 │                 │
+└─────────────────┘                 └─────────────────┘
+```
+
+**Why this matters:**
+
+1. **No package fetching:** Even if Claude tried to run `nix-shell -p evil-tool`:
+   - If the package isn't already in your local `/nix/store/`, Nix would try to fetch it
+   - The fetch fails because the Nix store is mounted read-only (can't write new packages)
+   - Even if the store were writable, nftables only allows `cache.nixos.org` for Nix - not arbitrary package sources
+   - Claude is limited to **exactly the tools that already exist in your host's Nix store**
+
+2. **Pre-determined toolset:** The `shell.nix` in the chroot references a specific nixpkgs snapshot (the one on your host). Claude gets:
+   - `claude-code` (the agent itself)
+   - `bash`, `coreutils`, `git`, `ripgrep`, etc. (standard dev tools)
+   - Nothing else, unless you've installed it on the host
+
+3. **No privilege to install:** Even if network were unrestricted:
+   ```bash
+   # Inside chroot - this fails
+   nix-env -iA nixpkgs.netcat
+   # Error: cannot write to /nix/store (read-only)
+
+   nix profile install nixpkgs#netcat
+   # Error: cannot write to /nix/var/nix (read-only)
+   ```
+
+4. **Managed settings as backup:** The `managed-settings.json` also denies:
+   - `Bash(nix-env:*)`
+   - `Bash(nix profile:*)`
+
+   So even attempting these commands would be blocked before hitting the read-only filesystem.
+
+**Comparison to container approaches:**
+
+| Approach | Can fetch new packages? | Toolset |
+|----------|------------------------|---------|
+| Docker (network) | Yes | Unlimited |
+| Docker (no network) | No | Image contents |
+| This chroot | No | Host's Nix store (mounted read-only) |
+
+**Implication for attackers:**
+
+If Claude (or code Claude writes) wanted to:
+- Download `netcat` to open a reverse shell → blocked (not in store + network blocked)
+- Install `nmap` to scan networks → blocked (not in store)
+- Add `curl` if missing → blocked (can't write to store)
+
+The only tools available are those **you explicitly have on your NixOS host**, and Claude cannot expand beyond that boundary.
+
+### 5. Privilege Separation
 
 - Setup/enter scripts run as root (required for chroot, mounts)
 - Claude runs as unprivileged `claude` user (UID 1000)
 - nftables rules only affect UID 1000, not host processes
 - Bind mounts are read-only where possible
 
-### 5. Audit Trail
+### 6. Audit Trail
 
 **Blocked connections are logged:**
 ```bash
@@ -177,4 +241,4 @@ This would be **blocked by nftables** (layer 2), but not by managed settings (la
 sudo sh scripts/claude-chroot-enter.sh --no-network /path/to/project
 ```
 
-This uses `unshare --net` to create an isolated network namespace with no connectivity. Claude can still work offline on your code.
+This uses `unshare --net` to create an isolated network namespace with no connectivity. **Note:** Claude requires API access to function, so this mode is only useful for testing the chroot setup, not for actual Claude usage.
